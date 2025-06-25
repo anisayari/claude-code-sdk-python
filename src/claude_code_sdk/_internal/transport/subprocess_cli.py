@@ -183,22 +183,76 @@ class SubprocessCLITransport(Transport):
             tg.start_soon(read_stderr)
 
             try:
+                json_buffer = ""
+                brace_count = 0
+                bracket_count = 0
+                in_string = False
+                escape_next = False
+                MAX_BUFFER_SIZE = 50 * 1024 * 1024  # 50MB limit
+                
                 async for line in self._stdout_stream:
                     line_str = line.strip()
                     if not line_str:
                         continue
 
-                    try:
-                        data = json.loads(line_str)
+                    # Check buffer size before adding
+                    if len(json_buffer) + len(line_str) > MAX_BUFFER_SIZE:
+                        # Buffer too large, likely a streaming issue
+                        raise SDKJSONDecodeError(
+                            f"JSON buffer exceeded {MAX_BUFFER_SIZE} bytes. Response too large.",
+                            ValueError("Buffer overflow")
+                        )
+                    
+                    # Add line to buffer
+                    if json_buffer:
+                        json_buffer += "\n" + line_str
+                    else:
+                        json_buffer = line_str
+                    
+                    # Count braces and brackets to detect complete JSON
+                    for char in line_str:
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        if char == '\\':
+                            escape_next = True
+                            continue
+                        if char == '"' and not escape_next:
+                            in_string = not in_string
+                        if not in_string:
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+                            elif char == '[':
+                                bracket_count += 1
+                            elif char == ']':
+                                bracket_count -= 1
+                    
+                    # Check if we have a complete JSON object
+                    if json_buffer and brace_count == 0 and bracket_count == 0 and not in_string:
                         try:
-                            yield data
-                        except GeneratorExit:
-                            # Handle generator cleanup gracefully
-                            return
-                    except json.JSONDecodeError as e:
-                        if line_str.startswith("{") or line_str.startswith("["):
-                            raise SDKJSONDecodeError(line_str, e) from e
-                        continue
+                            data = json.loads(json_buffer)
+                            try:
+                                yield data
+                            except GeneratorExit:
+                                # Handle generator cleanup gracefully
+                                return
+                            # Reset buffer
+                            json_buffer = ""
+                        except json.JSONDecodeError as e:
+                            # If it starts with JSON but fails to parse, it might be incomplete
+                            if json_buffer.startswith("{") or json_buffer.startswith("["):
+                                # Only continue if we haven't exceeded reasonable size
+                                if len(json_buffer) < MAX_BUFFER_SIZE:
+                                    continue
+                                else:
+                                    # Too large and still invalid
+                                    raise SDKJSONDecodeError(json_buffer[:1000] + "...", e) from e
+                            else:
+                                # Not JSON, reset buffer
+                                json_buffer = ""
+                                continue
 
             except anyio.ClosedResourceError:
                 pass
