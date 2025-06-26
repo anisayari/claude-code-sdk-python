@@ -190,10 +190,16 @@ class SubprocessCLITransport(Transport):
                 escape_next = False
                 MAX_BUFFER_SIZE = 50 * 1024 * 1024  # 50MB limit
                 
+                debug_json = os.environ.get("CLAUDE_CODE_DEBUG_JSON", "").lower() == "true"
+                
                 async for line in self._stdout_stream:
                     line_str = line.strip()
                     if not line_str:
                         continue
+                    
+                    if debug_json:
+                        print(f"[DEBUG] Line: {line_str[:100]}...")
+                        print(f"[DEBUG] Buffer size: {len(json_buffer)}, Braces: {brace_count}, Brackets: {bracket_count}, In string: {in_string}")
 
                     # Check buffer size before adding
                     if len(json_buffer) + len(line_str) > MAX_BUFFER_SIZE:
@@ -210,17 +216,22 @@ class SubprocessCLITransport(Transport):
                         json_buffer = line_str
                     
                     # Count braces and brackets to detect complete JSON
-                    for char in line_str:
-                        if escape_next:
-                            escape_next = False
-                            continue
-                        if char == '\\':
-                            escape_next = True
-                            continue
-                        if char == '"' and not escape_next:
-                            in_string = not in_string
-                        if not in_string:
-                            if char == '{':
+                    # Only process the new line, not the entire buffer
+                    i = 0
+                    while i < len(line_str):
+                        char = line_str[i]
+                        
+                        if in_string:
+                            if escape_next:
+                                escape_next = False
+                            elif char == '\\':
+                                escape_next = True
+                            elif char == '"':
+                                in_string = False
+                        else:
+                            if char == '"':
+                                in_string = True
+                            elif char == '{':
                                 brace_count += 1
                             elif char == '}':
                                 brace_count -= 1
@@ -228,6 +239,8 @@ class SubprocessCLITransport(Transport):
                                 bracket_count += 1
                             elif char == ']':
                                 bracket_count -= 1
+                        
+                        i += 1
                     
                     # Check if we have a complete JSON object
                     if json_buffer and brace_count == 0 and bracket_count == 0 and not in_string:
@@ -238,8 +251,12 @@ class SubprocessCLITransport(Transport):
                             except GeneratorExit:
                                 # Handle generator cleanup gracefully
                                 return
-                            # Reset buffer
+                            # Reset buffer and counters
                             json_buffer = ""
+                            brace_count = 0
+                            bracket_count = 0
+                            in_string = False
+                            escape_next = False
                         except json.JSONDecodeError as e:
                             # If it starts with JSON but fails to parse, it might be incomplete
                             if json_buffer.startswith("{") or json_buffer.startswith("["):
@@ -250,8 +267,12 @@ class SubprocessCLITransport(Transport):
                                     # Too large and still invalid
                                     raise SDKJSONDecodeError(json_buffer[:1000] + "...", e) from e
                             else:
-                                # Not JSON, reset buffer
+                                # Not JSON, reset buffer and counters
                                 json_buffer = ""
+                                brace_count = 0
+                                bracket_count = 0
+                                in_string = False
+                                escape_next = False
                                 continue
 
             except anyio.ClosedResourceError:
